@@ -1,0 +1,14 @@
+{
+    "api_key": {
+        "description": "百度千帆 API Key",
+        "type": "string",
+        "hint": "请输入完整的 API Key（格式如：bce-v3/ALTAK-xxx/yyy）",
+        "obvious_hint": true
+    },
+    "meme_path": {
+        "description": "表情包存储目录",
+        "type": "string",
+        "hint": "表情包存储的目录路径",
+        "default": "./memes"
+    }
+}
