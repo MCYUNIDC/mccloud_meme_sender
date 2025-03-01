@@ -17,7 +17,7 @@ import time
 # 用于跟踪每个用户的状态，防止超时或重复请求
 USER_STATES = {}
 
-@register("mccloud_meme_sender", "MC云-小馒头", "识别AI回复中的表情并发送对应表情包", "2.0")
+@register("mccloud_meme_sender", "MC云-小馒头", "识别AI回复中的表情并发送对应表情包，新加入AI识别表情包自动分配 百度智能云模型", "2.0")
 class MemeSender(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
