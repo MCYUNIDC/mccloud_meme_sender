@@ -29,7 +29,7 @@ class MemeSender(Star):
         self.logger = logging.getLogger(__name__)
 
         # 设置默认路径
-        self.meme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memes")
+        self.meme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "/AstrBot/data/plugins/mccloud_meme_sender/memes")
         
         # 从配置中获取路径和API密钥
         self.meme_path = self.config.get("meme_path", self.meme_path)
@@ -129,9 +129,13 @@ class MemeSender(Star):
                     self.found_emotions.append(emotion)
                     clean_text = clean_text.replace(match.group(0), '')
         
+        self.logger.debug(f"识别到的情绪: {self.found_emotions}")  # 添加日志输出
+        
         if self.found_emotions:
             # 更新回复文本(移除表情标记)
             response.completion_text = clean_text.strip()
+            # 发送调试信息到用户
+            event.plain_result(f"识别到的情绪: {', '.join(self.found_emotions)}")
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -141,6 +145,7 @@ class MemeSender(Star):
             
         result = event.get_result()
         if not result:
+            self.logger.warning("未找到结果，无法添加表情包")  # 添加日志输出
             return
             
         try:
@@ -185,7 +190,9 @@ class MemeSender(Star):
             
             # 设置结果
             event.set_result(result)
-            
+            # 发送调试信息到用户
+            event.plain_result(f"已添加表情包: {', '.join(self.found_emotions)}")
+
         except Exception as e:
             self.logger.error(f"处理表情失败: {str(e)}")
             import traceback

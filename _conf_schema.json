@@ -9,6 +9,6 @@
         "description": "表情包存储目录",
         "type": "string",
         "hint": "表情包存储的目录路径",
-        "default": "./memes"
+        "default": "/AstrBot/data/plugins/mccloud_meme_sender/memes"
     }
 }
