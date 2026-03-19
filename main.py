@@ -1,460 +1,259 @@
 import re
-import os
-import random
-import logging
-import json
-import base64
+import tempfile
 import asyncio
-import aiohttp
+import json
+from collections import defaultdict
+from pathlib import Path
+
 from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star, register
-from astrbot.api.provider import LLMResponse
-from astrbot.api.message_components import *
-from openai.types.chat.chat_completion import ChatCompletion
-from astrbot.api.all import *
-import time
+from astrbot.api.star import Context, Star, StarTools
+from astrbot.api import logger
 
-# 用于跟踪每个用户的状态，防止超时或重复请求
-USER_STATES = {}
+from .models import Option, Character
+from .drawer import draw_anan, draw_trial, MAX_OPTIONS_COUNT
+from .utils import get_statement, get_character
+from .constants import FACE_WHITELIST
 
-@register("mccloud_meme_sender", "MC云-小馒头", "识别AI回复中的表情并发送对应表情包，新加入AI识别表情包自动分配 百度智能云模型", "2.0")
-class MemeSender(Star):
-    def __init__(self, context: Context, config: dict = None):
-        super().__init__(context)
-        self.config = config or {}
-        self.found_emotions = []  # 存储找到的表情
-        
-        # 设置日志
-        logging.basicConfig(level=logging.DEBUG)
-        self.logger = logging.getLogger(__name__)
 
-        # 设置默认路径
-        self.meme_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "/AstrBot/data/plugins/mccloud_meme_sender/memes")
-        
-        # 从配置中获取路径和API密钥
-        self.meme_path = self.config.get("meme_path", self.meme_path)
-        self.api_key = self.config.get("api_key")
-        self.model = self.config.get("model", "deepseek-vl2")
-
-        # 检查配置文件是否存在
-        config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
-        if os.path.exists(config_file_path):
-            with open(config_file_path, 'r') as config_file:
-                emotion_config = json.load(config_file)
-                self.emotion_map = emotion_config.get("emotion_map", {})
-                self.logger.info(f"表情配置文件已加载: {config_file_path}")
-        else:
-            # 创建表情配置文件
-            self.emotion_map = {
-                "生气": "angry",
-                "开心": "happy",
-                "悲伤": "sad",
-                "惊讶": "surprised",
-                "疑惑": "confused",
-                "色色": "color",
-                "色": "color",
-                "死机": "cpu",
-                "笨蛋": "fool",
-                "给钱": "givemoney",
-                "喜欢": "like",
-                "看": "see",
-                "害羞": "shy",
-                "下班": "work",
-                "剪刀": "scissors",
-                "不回我": "reply",
-                "喵": "meow",
-                "八嘎": "baka",
-                "早": "morning",
-                "睡觉": "sleep",
-                "唉": "sigh",
-            }
-            with open(config_file_path, 'w') as config_file:
-                json.dump({"emotion_map": self.emotion_map}, config_file, ensure_ascii=False, indent=4)
-            self.logger.info(f"表情配置文件已创建: {config_file_path}")
-
-        # 检查表情包目录
-        self._check_meme_directories()
+class ManosabaMemesPlugin(Star):
+    """生成「魔法少女的魔法审判」的表情包插件
     
-    def _check_meme_directories(self):
-        """检查表情包目录是否存在并且包含图片"""
-        self.logger.info(f"表情包根目录: {self.meme_path}")
-        if not os.path.exists(self.meme_path):
-            self.logger.error(f"表情包根目录不存在: {self.meme_path}")
+    指令列表：
+    • 安安说 - 让安安举着写了你想说的话的素描本
+      用法: 安安说 [文本] [表情]
+      表情可选: 害羞, 生气, 病娇, 无语, 开心
+      别名: anan说, anansays
+    
+    • 审判表情包 - 生成审判时的选项图片
+      用法: 【疑问/反驳/伪证/赞同/魔法:[角色名]】[文本]
+      类型: 疑问, 反驳, 伪证, 赞同, 魔法
+      魔法角色: 梅露露, 诺亚, 汉娜, 奈叶香, 亚里沙, 米莉亚, 雪莉, 艾玛, 玛格, 安安, 可可, 希罗, 蕾雅
+    
+    • 切换角色 - 切换审判表情包中的角色（自动保存）
+      用法: 切换角色 [角色名]
+      角色可选: 艾玛, 希罗
+    
+    • 魔裁帮助 - 显示插件帮助信息
+      别名: manosaba帮助, 魔裁help
+    """
+    
+    def __init__(self, context: Context):
+        super().__init__(context)
+        self.character_map = defaultdict(lambda: Character.EMA)
+        self.data_file = None  # 将在 initialize 中设置
+
+    async def initialize(self):
+        """插件初始化方法"""
+        # 获取插件数据目录
+        data_dir = StarTools.get_data_dir()
+        self.data_file = data_dir / "character_preferences.json"
+        
+        # 确保数据目录存在
+        data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 加载用户角色偏好
+        await self._load_character_preferences()
+        
+        logger.info("魔裁 Memes 插件已加载")
+
+    async def _load_character_preferences(self):
+        """从文件加载用户角色偏好"""
+        try:
+            if self.data_file and self.data_file.exists():
+                with open(self.data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for session_id, character_name in data.items():
+                        try:
+                            self.character_map[session_id] = get_character(character_name)
+                        except ValueError:
+                            # 忽略无效的角色名，使用默认值
+                            logger.warning(f"加载角色偏好失败: 无效的角色名 {character_name}")
+                logger.info(f"已加载 {len(self.character_map)} 个用户的角色偏好")
+        except Exception as e:
+            logger.error(f"加载角色偏好失败: {e}")
+
+    async def _save_character_preferences(self):
+        """保存用户角色偏好到文件"""
+        try:
+            if self.data_file:
+                # 将 Character 枚举转换为字符串
+                data = {
+                    session_id: character.value
+                    for session_id, character in self.character_map.items()
+                }
+                with open(self.data_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                logger.debug(f"已保存 {len(self.character_map)} 个用户的角色偏好")
+        except Exception as e:
+            logger.error(f"保存角色偏好失败: {e}")
+
+    @filter.command("安安说", alias={"anan说", "anansays"})
+    async def handle_anan_says(self, event: AstrMessageEvent,message:str=""):
+        """让安安说话的插件
+
+        用法: 安安说 [文本] [表情]
+        表情可选: 害羞, 生气, 病娇, 无语, 开心
+        """
+        message_str = event.message_str
+        parts = message_str.split(maxsplit=1)
+
+        if len(parts) < 2:
+            yield event.plain_result("请输入文本。用法: 安安说 [文本] [表情]")
             return
-            
-        for emotion in self.emotion_map.values():
-            emotion_path = os.path.join(self.meme_path, emotion)
-            if not os.path.exists(emotion_path):
-                self.logger.error(f"表情目录不存在: {emotion_path}")
-                continue
-                
-            memes = [f for f in os.listdir(emotion_path) if f.endswith(('.jpg', '.png', '.gif'))]
-            if not memes:
-                self.logger.error(f"表情目录为空: {emotion_path}")
+
+        content = parts[1].strip()
+        # 尝试从右向左查找最后一个空格作为表情的分隔符
+        last_space_idx = content.rfind(' ')
+        if last_space_idx != -1:
+            potential_face = content[last_space_idx + 1:].strip()
+            if potential_face in FACE_WHITELIST:
+                text = content[:last_space_idx]
+                face = potential_face
             else:
-                self.logger.info(f"表情目录 {emotion} 包含 {len(memes)} 个图片")
-
-    def _create_config_file(self):
-        """创建配置文件并写入默认配置"""
-        config_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_conf_schema.json')
-        
-        with open(config_file_path, 'w') as config_file:
-            json.dump(self.config, config_file, ensure_ascii=False, indent=4)
-        self.logger.info(f"配置文件已创建: {config_file_path}")
-
-    @filter.on_llm_response(priority=90)
-    async def resp(self, event: AstrMessageEvent, response: LLMResponse):
-        """处理 LLM 响应，识别表情"""
-        if not response or not response.completion_text:
-            return
-        
-        text = response.completion_text
-        self.found_emotions = []  # 重置表情列表
-        
-        # 定义表情正则模式
-        patterns = [
-            r'\[([^\]]+)\]',  # [生气]
-            r'\(([^)]+)\)',   # (生气)
-            r'（([^）]+)）'    # （生气）
-        ]
-        
-        clean_text = text
-        
-        # 查找所有表情标记
-        for pattern in patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                emotion = match.group(1)
-                if emotion in self.emotion_map:
-                    self.found_emotions.append(emotion)
-                    clean_text = clean_text.replace(match.group(0), '')
-        
-        self.logger.debug(f"识别到的情绪: {self.found_emotions}")  # 添加日志输出
-        
-        if self.found_emotions:
-            # 更新回复文本(移除表情标记)
-            response.completion_text = clean_text.strip()
-            # 发送调试信息到用户
-            event.plain_result(f"识别到的情绪: {', '.join(self.found_emotions)}")
-
-    @filter.on_decorating_result()
-    async def on_decorating_result(self, event: AstrMessageEvent):
-        """在消息发送前处理表情"""
-        if not self.found_emotions:
-            return
-            
-        result = event.get_result()
-        if not result:
-            self.logger.warning("未找到结果，无法添加表情包")  # 添加日志输出
-            return
-            
-        try:
-            # 创建新的消息链
-            chains = []
-            
-            # 添加原始文本消息链
-            original_chain = result.chain
-            if original_chain:
-                if isinstance(original_chain, str):
-                    chains.append(Plain(original_chain))
-                elif isinstance(original_chain, MessageChain):
-                    chains.extend(original_chain)
-                elif isinstance(original_chain, list):
-                    chains.extend(original_chain)
-                else:
-                    self.logger.warning(f"未知的消息链类型: {type(original_chain)}")
-            
-            # 添加表情包
-            for emotion in self.found_emotions:
-                emotion_en = self.emotion_map.get(emotion)
-                if not emotion_en:
-                    continue
-                    
-                emotion_path = os.path.join(self.meme_path, emotion_en)
-                if os.path.exists(emotion_path):
-                    memes = [f for f in os.listdir(emotion_path) if f.endswith(('.jpg', '.png', '.gif'))]
-                    if memes:
-                        meme = random.choice(memes)
-                        meme_file = os.path.join(emotion_path, meme)
-                        
-                        # 使用正确的方式添加图片到消息链
-                        chains.append(Image.fromFileSystem(meme_file))
-            
-            # 使用 make_result() 构建结果
-            result = event.make_result()
-            for component in chains:
-                if isinstance(component, Plain):
-                    result = result.message(component.text)
-                elif isinstance(component, Image):
-                    result = result.file_image(component.path)
-            
-            # 设置结果
-            event.set_result(result)
-            # 发送调试信息到用户
-            event.plain_result(f"已添加表情包: {', '.join(self.found_emotions)}")
-
-        except Exception as e:
-            self.logger.error(f"处理表情失败: {str(e)}")
-            import traceback
-            self.logger.error(traceback.format_exc())
-            
-        # 清空表情列表
-        self.found_emotions = []
-
-    @filter.after_message_sent()
-    async def after_message_sent(self, event: AstrMessageEvent):
-        """消息发送后的清理工作"""
-        self.found_emotions = []  # 确保清空表情列表
-
-    @filter.command("save")
-    async def start_importing_images(self, event: AstrMessageEvent):
-        """开始导入图片"""
-        user_id = event.get_sender_id()
-        USER_STATES[user_id] = {"importing": True}
-        yield event.plain_result("开始导入图片，请发送你要识别的图片。输入 /esc 结束导入。")
-
-    @filter.command("esc")
-    async def end_importing_images(self, event: AstrMessageEvent):
-        """结束导入图片"""
-        user_id = event.get_sender_id()
-        if user_id in USER_STATES:
-            del USER_STATES[user_id]
-            yield event.plain_result("结束导入图片。")
+                text = content
+                face = None
         else:
-            yield event.plain_result("你还没有开始导入图片。")
+            text = content
+            face = None
 
-    @event_message_type(EventMessageType.ALL)
-    async def handle_image(self, event: AstrMessageEvent):
-        user_id = event.get_sender_id()
-        if user_id not in USER_STATES or not USER_STATES[user_id].get("importing"):
-            return  # 如果用户没有发起请求，跳过
+        text = text.replace("\\n", "\n")
         
-        # 检查消息中是否包含图片
-        images = [c for c in event.message_obj.message if isinstance(c, Image)]
-        if not images:
+        try:
+            loop = asyncio.get_event_loop()
+            image_bytes = await loop.run_in_executor(None, draw_anan, text, face)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                f.write(image_bytes)
+                temp_path = f.name
+            try:
+                yield event.image_result(temp_path)
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+        except Exception as e:
+            logger.error(f"生成安安说话图片失败: {e}")
+            yield event.plain_result(f"生成图片失败: {str(e)}")
+
+    @filter.regex(r"【(疑问|反驳|伪证|赞同|魔法)(?:[:：]([^】]*))?】(.+)", flags=re.MULTILINE)
+    async def handle_trial(self, event: AstrMessageEvent,message:str=""):
+        """生成审判表情包
+
+        用法: 【疑问/反驳/伪证/赞同/魔法:[角色名]】这是一个选项文本
+        角色名可选: 梅露露, 诺亚, 汉娜, 奈叶香, 亚里沙, 米莉亚, 雪莉, 艾玛, 玛格, 安安, 可可, 希罗, 蕾雅
+        可发送多行以添加多个选项
+
+        注意：最多支持 10 个选项
+        """
+        message_str = event.message_str
+        matches = re.findall(
+            r"^【(疑问|反驳|伪证|赞同|魔法)(?:[:：]([^】]*))?】(.+)$",
+            message_str,
+            flags=re.M,
+        )
+
+        options = []
+        for statement_type, arg, text in matches:
+            try:
+                statement_enum = get_statement(statement_type, arg)
+                options.append(Option(statement_enum, text))
+            except ValueError as e:
+                # 直接显示 utils.py 返回的清晰错误信息
+                yield event.plain_result(str(e))
+                return
+
+        # 前置校验：检查选项数量
+        if len(options) > MAX_OPTIONS_COUNT:
+            yield event.plain_result(f"选项数量过多，最多支持 {MAX_OPTIONS_COUNT} 个选项")
             return
         
-        # 获取图片 URL
-        image_urls = [images[i].url for i in range(len(images))]  # 获取所有图片的 URL
-        response = await self.call_baidu_ai(image_urls)
-        
-        # 处理 AI 返回的结果
-        chain = [
-            Plain(f"以下是这张图片的描述：{response}")
-        ]
-        yield event.chain_result(chain)
-
-    def _get_timestamp(self):
-        """获取当前时间戳"""
-        from datetime import datetime, timezone
-        return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-
-    def _get_signature(self, secret_key, timestamp):
-        """计算签名"""
-        import hmac
-        import hashlib
-        import base64
-        
-        # 构建规范化请求字符串
-        http_method = "POST"
-        path = "/v1/BCE-BEARER/token"
-        params = f"expireInSeconds=86400"
-        
-        # 按照规范组织签名字符串
-        sign_key_info = f"bce-auth-v1/{self.config['api_key']}/{timestamp}/1800"
-        sign_key = hmac.new(
-            secret_key.encode('utf-8'),
-            sign_key_info.encode('utf-8'),
-            hashlib.sha256
-        ).digest()
-        
-        string_to_sign = f"{http_method}\n{path}\n{params}\n"  # 注意最后的换行符
-        
-        # 计算最终签名
-        signature = hmac.new(
-            sign_key,
-            string_to_sign.encode('utf-8'),
-            hashlib.sha256
-        ).digest()
-        
-        return base64.b64encode(signature).decode('utf-8')
-
-    async def get_access_token(self):
-        """获取百度 AI 的 access token"""
-        api_key = self.config.get("api_key", "")
-        secret_key = self.config.get("secret_key", "")
-        
-        # 如果 API Key 以 bce-v3/ 开头，提取 ALTAK 部分作为 client_id
-        if api_key.startswith('bce-v3/'):
-            parts = api_key.split('/')
-            if len(parts) >= 3:
-                client_id = parts[1]  # 使用 ALTAK-xxx 部分作为 client_id
-                self.logger.debug(f"从 bce-v3/ 格式中提取 client_id: {client_id}")
-                api_key = client_id
-        
-        if not api_key or not secret_key:
-            raise ValueError("API Key 或 Secret Key 未配置。请在配置文件中设置。")
-
-        url = "https://aip.baidubce.com/oauth/2.0/token"
-        params = {
-            'grant_type': 'client_credentials',
-            'client_id': api_key,
-            'client_secret': secret_key
-        }
-
-        self.logger.debug(f"正在获取 access token")
-        self.logger.debug(f"请求 URL: {url}")
-        self.logger.debug(f"client_id: {api_key}")
+        if len(options) == 0:
+            yield event.plain_result("请至少输入一个选项")
+            return
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, params=params) as resp:
-                    error_data = await resp.text()
-                    self.logger.debug(f"响应状态码: {resp.status}")
-                    self.logger.debug(f"响应内容: {error_data}")
-                    
-                    if resp.status != 200:
-                        raise Exception(f"获取 access token 失败，状态码: {resp.status}, 响应: {error_data}")
-                    
-                    data = await resp.json()
-                    if 'access_token' not in data:
-                        raise Exception("获取 access token 失败，响应中没有 access_token")
-                    
-                    self.logger.info("成功获取 access token")
-                    return data['access_token']
+            loop = asyncio.get_event_loop()
+            image_bytes = await loop.run_in_executor(
+                None, draw_trial, self.character_map[event.get_session_id()], options
+            )
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                f.write(image_bytes)
+                temp_path = f.name
+            try:
+                yield event.image_result(temp_path)
+            finally:
+                Path(temp_path).unlink(missing_ok=True)
+        except ValueError as e:
+            # 捕获选项数量等业务级错误
+            yield event.plain_result(str(e))
+        except OverflowError:
+            yield event.plain_result("选项过多，请减少选项数量")
         except Exception as e:
-            self.logger.error(f"获取 access token 失败: {str(e)}")
-            raise
+            logger.error(f"生成审判图片失败: {e}")
+            yield event.plain_result(f"生成图片失败: {str(e)}")
 
-    async def _save_image(self, img_url, emotion):
-        """保存图片到对应的情绪目录"""
-        emotion_en = self.emotion_map.get(emotion)
-        if not emotion_en:
-            return f"未找到对应的情绪目录：{emotion}"
-
-        # 确保目录存在
-        emotion_path = os.path.join(self.meme_path, emotion_en)
-        os.makedirs(emotion_path, exist_ok=True)
-
-        try:
-            # 确保 img_url 是有效的，并且以 https:// 开头
-            if not img_url.startswith("https://"):
-                img_url = "https://" + img_url  # 添加 https:// 前缀
-
-            self.logger.debug(f"准备下载图片，URL: {img_url}")
-            # 下载图片
-            async with aiohttp.ClientSession() as session:
-                async with session.get(img_url) as resp:
-                    self.logger.debug(f"图片下载响应状态码: {resp.status}")
-                    if resp.status == 200:
-                        # 生成唯一文件名
-                        filename = f"{emotion_en}_{int(time.time())}_{random.randint(1000, 9999)}.jpg"
-                        file_path = os.path.join(emotion_path, filename)
-                        
-                        # 保存图片
-                        content = await resp.read()
-                        if not content:
-                            return f"下载的图片内容为空"
-                            
-                        with open(file_path, 'wb') as f:
-                            f.write(content)
-                        
-                        self.logger.info(f"图片已成功保存: {file_path}")
-                        return file_path
-                    else:
-                        error_msg = f"下载图片失败: HTTP {resp.status}"
-                        self.logger.error(error_msg)
-                        return error_msg
-        except aiohttp.ClientError as e:
-            error_msg = f"网络请求失败: {str(e)}"
-            self.logger.error(error_msg)
-            return error_msg
-        except IOError as e:
-            error_msg = f"文件写入失败: {str(e)}"
-            self.logger.error(error_msg)
-            return error_msg
-        except Exception as e:
-            error_msg = f"保存图片时发生未知错误: {str(e)}"
-            self.logger.error(error_msg)
-            return error_msg
-
-    async def call_baidu_ai(self, img_urls):
-        """调用百度 AI 进行图片识别"""
-        api_key = self.config.get("api_key", "")
-        if not api_key:
-            raise ValueError("API Key 未配置。请在配置文件中设置。")
-
-        url = "https://qianfan.baidubce.com/v2/chat/completions"
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Bearer {api_key}'
-        }
-
-        # 构建消息内容，要求返回简单的情绪描述
-        content = [
-            {
-                "type": "text",
-                "text": "请分析这张图片表达的情绪，只需要用一个词回答，例如：开心、悲伤、生气、惊讶等。请确保回答的情绪在以下列表中："
-            }
-        ]
+    @filter.command("切换角色")
+    async def handle_switch_character(self, event: AstrMessageEvent,message:str=""):
+        """切换审判选择中的角色
         
-        # 添加图片
-        for img_url in img_urls:
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": img_url
-                }
-            })
-
-        # 从配置文件中获取情绪列表
-        emotions_list = list(self.emotion_map.keys())
-        content[0]["text"] += "、".join(emotions_list)
-
-        payload = {
-            "model": "deepseek-vl2",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": content
-                }
-            ]
-        }
-
+        用法: 切换角色 [角色名]
+        角色名可选: 艾玛, 希罗
+        """
+        message_str = event.message_str
+        parts = message_str.split(maxsplit=2)
+        
+        if len(parts) < 2:
+            yield event.plain_result("请输入角色名。用法: 切换角色 [角色名]")
+            return
+        
+        character_name = parts[1]
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
-                    error_data = await resp.text()
-                    self.logger.debug(f"响应状态码: {resp.status}")
-                    self.logger.debug(f"响应内容: {error_data}")
+            character = get_character(character_name)
+            self.character_map[event.get_session_id()] = character
+            # 保存用户偏好
+            await self._save_character_preferences()
+            yield event.plain_result(f"已切换角色为 {character_name}")
+        except ValueError as e:
+            # 直接显示 utils.py 返回的清晰错误信息
+            yield event.plain_result(str(e))
 
-                    if resp.status != 200:
-                        error_msg = f"百度 AI 响应错误: 状态码 {resp.status}"
-                        if error_data:
-                            error_msg += f", 响应: {error_data}"
-                        self.logger.error(error_msg)
-                        raise Exception(error_msg)
-                    
-                    data = await resp.json()
-                    if "error" in data:
-                        raise Exception(f"API 调用失败: {data['error'].get('message', '未知错误')}")
-                    
-                    emotion = data['choices'][0]['message']['content'].strip()
-                    result = [f"识别到的情绪是：{emotion}"]
-                    
-                    # 如果识别出的情绪在表情映射中，保存图片
-                    if emotion in self.emotion_map:
-                        save_result = await self._save_image(img_urls[0], emotion)
-                        if os.path.exists(str(save_result)):
-                            result.append(f"✅ 图片已成功保存到：{save_result}")
-                        else:
-                            result.append(f"❌ 图片保存失败：{save_result}")
-                    else:
-                        result.append(f"⚠️ 未找到匹配的情绪类型 '{emotion}'，无法保存图片")
-                    
-                    return "\n".join(result)
+    @filter.command("魔裁帮助", alias={"manosaba帮助", "魔裁help"})
+    async def handle_help(self, event: AstrMessageEvent,message:str=""):
+        """显示插件帮助信息"""
+        help_text = """🌸 魔裁 Memes 插件使用说明 🌸
 
-        except aiohttp.ClientError as e:
-            error_msg = f"网络请求失败: {str(e)}"
-            self.logger.error(error_msg)
-            raise Exception(error_msg)
+📖 指令列表：
+
+1️⃣ 安安说
+用法: 安安说 [文本] [表情]
+说明: 让安安举着写了你想说的话的素描本
+表情可选: 害羞, 生气, 病娇, 无语, 开心
+别名: anan说, anansays
+示例: 安安说 吾辈现在不想说话
+示例: 安安说 吾辈命令你现在【猛击自己的魔丸一百下】 生气
+
+2️⃣ 审判表情包
+用法: 【疑问/反驳/伪证/赞同/魔法:[角色名]】[文本]
+说明: 生成审判时的选项图片，支持多行输入生成多个选项
+类型: 疑问, 反驳, 伪证, 赞同, 魔法
+魔法角色: 梅露露, 诺亚, 汉娜, 奈叶香, 亚里沙, 米莉亚, 雪莉, 艾玛, 玛格, 安安, 可可, 希罗, 蕾雅
+注意：最多支持 10 个选项
+示例: 【伪证】我和艾玛不是恋人
+示例: 【魔法: 诺亚】液体操控  （冒号后可以有空格）
+
+3️⃣ 切换角色
+用法: 切换角色 [角色名]
+说明: 切换审判表情包中的角色（自动保存）
+角色可选: 艾玛, 希罗
+示例: 切换角色 希罗
+
+💡 小贴士:
+• 在文本中输入 \\n 可以换行
+• 中括号【】中的内容会被渲染成紫色
+• 选项数量建议 3 条以内效果最佳，最多支持 10 条
+• 角色选择会自动保存，重启后依然有效
+• 角色名和表情名会自动去除首尾空格，支持常见输入格式"""
+        yield event.plain_result(help_text)
+
+    async def terminate(self):
+        """插件销毁方法"""
+        # 保存用户偏好
+        await self._save_character_preferences()
+        logger.info("魔裁 Memes 插件已卸载")
